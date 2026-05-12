@@ -44,6 +44,42 @@ def fedavg_aggregate(global_model, local_weights_list, client_sizes):
     global_model.load_state_dict(avg_weights)
     return global_model
 
+def flatten_weights(weights):
+    return torch.cat([p.float().view(-1).cpu() for p in weights.values()])
+
+
+def krum_aggregate(global_model, local_weights_list, client_sizes=None, num_malicious=0):
+    n = len(local_weights_list)
+    f = num_malicious
+
+    if n <= 2 * f + 2:
+        print("[Krum Warning] Not enough clients for Krum. Falling back to FedAvg.")
+        if client_sizes is None:
+            client_sizes = [1] * n
+        return fedavg_aggregate(global_model, local_weights_list, client_sizes)
+
+    vectors = [flatten_weights(w) for w in local_weights_list]
+    scores = []
+
+    for i in range(n):
+        distances = []
+        for j in range(n):
+            if i != j:
+                dist = torch.sum((vectors[i] - vectors[j]) ** 2).item()
+                distances.append(dist)
+
+        distances.sort()
+        num_neighbors = n - f - 2
+        score = sum(distances[:num_neighbors])
+        scores.append(score)
+
+    selected_idx = scores.index(min(scores))
+    selected_weights = local_weights_list[selected_idx]
+
+    print(f"[Krum] Selected update index: {selected_idx}")
+
+    global_model.load_state_dict(selected_weights)
+    return global_model
 
 # ─────────────────────────────────────────────────────────────────
 # One Full Communication Round — supports boosted malicious epochs
@@ -60,9 +96,11 @@ def run_round(
     client_fraction=1.0,
     malicious_clients=None,
     label_flip_map=None,
-    malicious_local_epochs=3,   # ← NEW: if set, malicious clients
+    malicious_local_epochs=None,   # ← NEW: if set, malicious clients
                                    #        train for this many epochs
                                    #        instead of local_epochs
+    aggregation_method="fedavg",
+    num_malicious=0,                               
     verbose=True
 ):
     """
@@ -156,9 +194,21 @@ def run_round(
                   f"loss={avg_loss:.4f}")
 
     # ── Step 3: FedAvg aggregation ────────────────────────────────
-    global_model   = fedavg_aggregate(
-        global_model, local_weights_list, client_sizes
-    )
+    if aggregation_method.lower() == "fedavg":
+        global_model = fedavg_aggregate(
+            global_model, local_weights_list, client_sizes
+        )
+
+    elif aggregation_method.lower() == "krum":
+        global_model = krum_aggregate(
+            global_model,
+            local_weights_list,
+            client_sizes=client_sizes,
+            num_malicious=num_malicious
+        )
+
+    else:
+        raise ValueError(f"Unknown aggregation method: {aggregation_method}")
     avg_round_loss = sum(round_losses) / len(round_losses)
 
     if verbose:
